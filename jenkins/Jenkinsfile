@@ -1,0 +1,145 @@
+pipeline {
+  agent any
+  environment {
+    NOTIFY_WEBHOOK_URL = credentials('notify-webhook-url')        
+  }
+
+stages {
+    stage('SAST'){
+      agent {
+        docker {
+          image 'maven:3-jdk-11'
+         }
+      }
+      when {
+        expression {
+          env.GIT_LOCAL_BRANCH == 'dev'
+        }
+      }
+      steps {
+        withCredentials([string(credentialsId: env.SONAR_TOKEN_NAME, variable: 'SONAR_TOKEN')]) {
+          sh "export SONAR_TOKEN=$SONAR_TOKEN"
+          sh "mvn clean verify sonar:sonar -DskipTests -U -s ./settings.xml"
+        }
+      }
+    }
+
+    stage('Build Jar files') {
+      agent {
+        docker {
+          image 'maven:3-alpine'
+        }
+      }
+
+      environment {
+        MAVEN_SETTINGS_XML = credentials('maven-gitlab-credentials-settings-xml')
+      }
+
+      steps {
+        sh "mvn -s $MAVEN_SETTINGS_XML -DskipTests -U clean package"
+
+        stash includes: '**/target/*.jar', name: 'jars'
+      }
+
+      post{
+        failure {
+          office365ConnectorSend webhookUrl: "${env.NOTIFY_WEBHOOK_URL}",
+            message: "CI: Build Jar failure : Job Name - Branch -Build No. [${env.JOB_NAME} - ${env.GIT_LOCAL_BRANCH} - ${env.BUILD_NUMBER}]  : (<${env.BUILD_URL}|Open>)" ,
+            status: 'Failure'          
+
+          //rocketSend(message: "CI: Build Jar failure")
+        }
+      }
+    }
+
+    stage('Build and publish Docker images') {
+      steps {
+        unstash(name: 'jars')
+
+        buildAndPublishImages("$IMAGE_NAME")
+      }
+
+      post{
+        always {
+          removeImage("$IMAGE_NAME")
+        }
+
+        failure {
+          office365ConnectorSend webhookUrl: "${env.NOTIFY_WEBHOOK_URL}",
+            message: "CI: Build Docker failure : Job Name - Branch -Build No. [${env.JOB_NAME} - ${env.GIT_LOCAL_BRANCH} - ${env.BUILD_NUMBER}]  : (<${env.BUILD_URL}|Open>)" ,
+            status: 'Failure'          
+
+          //rocketSend(message: "CI: Build Docker failure")
+        }
+      }
+    }
+
+    stage('Trigger UpdateDeploymentImage build') {
+      steps {
+        script {
+
+          timestampTag = "$BUILD_NUMBER" + "-" + "$BUILD_TIMESTAMP"+ "-" + "$GIT_LOCAL_BRANCH"
+          def imageUri = "$IMAGE_NAME" + ':' + timestampTag
+
+          // trigger UpdateDeploymentImage and return (do not wait)
+          build job: 'UpdateDeploymentImage', parameters: [
+              string(name: "SERVICE_NAME", value: "claim-service"),
+              string(name: "IMAGE_URI", value: imageUri),
+          ], wait: false
+
+        }
+      }
+    }
+
+    stage('Notification') {
+      steps {
+        echo(message: 'Final')
+      }
+
+      post{
+        success {
+          script {
+            timestampTag = "$BUILD_NUMBER" + "-" + "$BUILD_TIMESTAMP" + "-" + "$GIT_LOCAL_BRANCH"
+          }
+          office365ConnectorSend webhookUrl: "${env.NOTIFY_WEBHOOK_URL}",
+            message: "CI: Success : Job Name - Branch -Build No. [${env.JOB_NAME} - ${env.GIT_LOCAL_BRANCH} - ${env.BUILD_NUMBER}] :  " + timestampTag +" : (<${env.BUILD_URL}|Open>)" ,
+            status: 'Success'          
+
+          //rocketSend(message: "CI: Success " + timestampTag)
+        }
+      }
+    }
+  }
+}
+
+void buildAndPublishImages(targetImageName) {
+  script {
+    def branchTag = "$GIT_LOCAL_BRANCH"
+    def commitTag = "$GIT_COMMIT"
+    def timestampTag = "$BUILD_NUMBER" + "-" + "$BUILD_TIMESTAMP" + "-" + "$GIT_LOCAL_BRANCH"
+
+    def dockerImageName = targetImageName + ":" + commitTag
+
+    def dockerImage = docker.build dockerImageName
+
+    docker.withRegistry('https://registry.gitlab.com', 'gitlab-registry-username-password') {
+      dockerImage.push()
+      dockerImage.push(branchTag)
+      dockerImage.push(timestampTag)
+    }
+  }
+}
+
+void removeImage(imageName) {
+  script {
+    try {
+      def commitTag = "$GIT_COMMIT"
+
+      def dockerImageName = imageName + ":" + commitTag
+
+      sh "docker rmi " + dockerImageName
+    } catch (error) {
+      echo error.getMessage()
+    }
+  }
+}
